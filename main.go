@@ -16,6 +16,7 @@ import (
 type Cmd struct {
 	concurrency int64
 	totalNumber int64
+	duration    int64
 	url         string
 	filePath    string
 	httpMethod  string
@@ -57,6 +58,7 @@ func parseCmd() (cmd Cmd, err error) {
 
 	flag.Int64Var(&cmd.concurrency, "c", 0, "并发数")
 	flag.Int64Var(&cmd.totalNumber, "n", 0, "请求总次数")
+	flag.Int64Var(&cmd.duration, "a", 0, "请求总时长，单位：s")
 	flag.Int64Var(&cmd.timeout, "t", 1, "默认超时时间1ms")
 	flag.StringVar(&cmd.url, "u", "", "请求的url")
 	flag.StringVar(&cmd.filePath, "f", "", "文件路径")
@@ -80,8 +82,8 @@ func parseCmd() (cmd Cmd, err error) {
 		return
 	}
 
-	if cmd.totalNumber == 0 {
-		fmt.Println("-n 必须填")
+	if cmd.totalNumber == 0 && cmd.duration == 0 {
+		fmt.Println("-n 和 -a 必须填一项")
 		usage()
 
 		err = errors.New("parseCmd error")
@@ -104,6 +106,7 @@ func usage() {
 	fmt.Println(`选项：
   -c  并发数
   -n  请求总次数
+  -a  请求持续时间，单位：秒，优先使用-n参数
   -m  HTTP method，默认：get
   -u  请求的url
   -d  post时的请求参数
@@ -118,39 +121,99 @@ func usage() {
  * 压测过程
  */
 func work(cmd Cmd) (result Result) {
-	httpRequestChan := produceHttpRequest(cmd)
+	httpRequestList := produceHttpRequest(cmd)
 
-	resultChan := make(chan *HttpResult, cmd.totalNumber)
+	// 如果是总次数发压，拼接好cmd.totalNumber总数的请求，
+	// 如果是按持续时间发压，设置好stop标志位，由定时器修改
+	stop := false
+	if cmd.totalNumber != 0 {
+		if cmd.totalNumber > int64(len(httpRequestList)) {
+			index := 0
+			for i := int64(0); i < cmd.totalNumber-int64(len(httpRequestList)); i++ {
+				if index >= len(httpRequestList) {
+					index = 0
+				}
+				httpRequestList = append(httpRequestList, httpRequestList[index])
+			}
+		}
+	} else {
+		go func() {
+			duration := 0
+			ticker := time.NewTicker(time.Second)
+			for range ticker.C {
+				duration++
+				if int64(duration) >= cmd.duration {
+					stop = true
+					break
+				}
+			}
+		}()
+	}
+
+	resultList := make([][]*HttpResult, cmd.concurrency)
 	result.startTime = time.Now()
 	var wg sync.WaitGroup
 	for i := int64(0); i < cmd.concurrency; i++ {
 		wg.Add(1)
-		go func() {
+		go func(_i int64) {
 			defer wg.Done()
 
-			for _httpRequest := range httpRequestChan {
-				resultChan <- sendHttp(_httpRequest)
+			resultList[_i] = make([]*HttpResult, 0)
+			// 同时支持总次数和总时间
+			if cmd.totalNumber != 0 {
+				for _, _httpRequest := range httpRequestList {
+					resultList[_i] = append(resultList[_i], sendHttp(_httpRequest))
+				}
+			} else {
+				// 每十次判断一次结束状态
+				start := 0
+				end := 0
+				for ; ; {
+					if stop == true {
+						break
+					}
+
+					start = start + 10
+					end = start + 10
+					if start >= len(httpRequestList) {
+						start = 0
+						end = start + 10
+					}
+					if end >= len(httpRequestList) {
+						end = len(httpRequestList)
+					}
+					for _, _httpRequest := range httpRequestList[start:end] {
+						resultList[_i] = append(resultList[_i], sendHttp(_httpRequest))
+					}
+				}
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 	result.endTime = time.Now()
-	close(resultChan)
 
-	for _result := range resultChan {
-		result.httpResult = append(result.httpResult, _result)
+	httpResultTmp := make([]*HttpResult, 0)
+	for _, result := range resultList {
+		for _, _result := range result {
+			httpResultTmp = append(httpResultTmp, _result)
+		}
 	}
+	result.httpResult = httpResultTmp
 	return result
 }
 
 /**
  * 构造HttpRequest
  */
-func produceHttpRequest(cmd Cmd) (httpRequestChan chan *HttpRequest) {
+func produceHttpRequest(cmd Cmd) (httpRequestList []*HttpRequest) {
 	method := cmd.httpMethod
 	timeout := time.Second * time.Duration(cmd.timeout)
 
-	httpRequestChan = make(chan *HttpRequest, cmd.totalNumber)
+	httpRequestList = make([]*HttpRequest, 0)
+	totalNumber := cmd.totalNumber
+	if totalNumber == 0 {
+		totalNumber = 10
+	}
 
 	// 读取文件
 	fileLines := make([]string, 0)
@@ -170,26 +233,21 @@ func produceHttpRequest(cmd Cmd) (httpRequestChan chan *HttpRequest) {
 	// get方式下，文件里面读出来的可变参数信息拼接到url后面
 	if method == "get" {
 		if len(fileLines) == 0 {
-			for i := int64(0); i < cmd.totalNumber; i++ {
+			for i := int64(0); i < totalNumber; i++ {
 				httpRequest := new(HttpRequest)
 				httpRequest.url = cmd.url
 				httpRequest.method = method
 				httpRequest.timeout = timeout
-				httpRequestChan <- httpRequest
+				httpRequestList = append(httpRequestList, httpRequest)
 			}
 		} else {
-			index := 0
 			fileLen := len(fileLines)
-			for i := int64(0); i < cmd.totalNumber; i++ {
-				if index >= fileLen {
-					index = 0
-				}
+			for i := 0; i < fileLen; i++ {
 				httpRequest := new(HttpRequest)
-				httpRequest.url = cmd.url + fileLines[index]
+				httpRequest.url = cmd.url + fileLines[i]
 				httpRequest.method = method
 				httpRequest.timeout = timeout
-				httpRequestChan <- httpRequest
-				index++
+				httpRequestList = append(httpRequestList, httpRequest)
 			}
 		}
 	} else {
@@ -200,35 +258,28 @@ func produceHttpRequest(cmd Cmd) (httpRequestChan chan *HttpRequest) {
 		}
 
 		if len(fileLines) == 0 {
-			for i := int64(0); i < cmd.totalNumber; i++ {
+			for i := int64(0); i < totalNumber; i++ {
 				httpRequest := new(HttpRequest)
 				httpRequest.url = cmd.url
 				httpRequest.method = method
 				httpRequest.timeout = timeout
 				httpRequest.postStr = postStr
-				httpRequestChan <- httpRequest
+				httpRequestList = append(httpRequestList, httpRequest)
 			}
 		} else {
-			index := 0
 			fileLen := len(fileLines)
-			for i := int64(0); i < cmd.totalNumber; i++ {
-				if index >= fileLen {
-					index = 0
-				}
+			for i := 0; i < fileLen; i++ {
 				httpRequest := new(HttpRequest)
 				httpRequest.url = cmd.url
-				httpRequest.postStr = postStr + fileLines[index]
+				httpRequest.postStr = postStr + fileLines[i]
 				httpRequest.method = method
 				httpRequest.timeout = timeout
-				httpRequestChan <- httpRequest
-				index++
+				httpRequestList = append(httpRequestList, httpRequest)
 			}
 		}
 	}
 
-	close(httpRequestChan)
-
-	return httpRequestChan
+	return httpRequestList
 }
 
 /**
